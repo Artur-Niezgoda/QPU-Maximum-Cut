@@ -6,7 +6,7 @@ from typing import Sequence, List, Tuple, Any, Callable
 
 # This list will store the objective function values during optimization.
 # It's passed as an argument to the cost function to avoid global variables.
-objective_func_vals_list = []
+objective_func_vals_list_functions_py = []
 
 def build_max_cut_paulis(graph: rx.PyGraph) -> List[Tuple[str, float]]:
     """
@@ -20,13 +20,17 @@ def build_max_cut_paulis(graph: rx.PyGraph) -> List[Tuple[str, float]]:
         A list of tuples, where each tuple contains a Pauli string and its coefficient.
     """
     pauli_list = []
-    num_nodes = len(graph) # Use graph.num_nodes() or len(graph)
+    num_nodes = len(graph.nodes()) # Use graph.num_nodes() or len(graph.nodes())
     for u, v, weight in graph.weighted_edge_list():
         paulis = ["I"] * num_nodes
-        paulis[u] = "Z"
-        paulis[v] = "Z"
-        # Qiskit Pauli strings are read from right to left (qubit 0 is the rightmost)
-        pauli_list.append(("".join(paulis)[::-1], float(weight))) # Ensure weight is float
+        # Ensure u and v are valid indices for the paulis list
+        if u < num_nodes and v < num_nodes:
+            paulis[u] = "Z"
+            paulis[v] = "Z"
+            # Qiskit Pauli strings are read from right to left (qubit 0 is the rightmost)
+            pauli_list.append(("".join(paulis)[::-1], float(weight))) # Ensure weight is float
+        else:
+            print(f"Warning: Edge ({u}, {v}) contains node index out of bounds for {num_nodes} nodes. Skipping this edge for Pauli construction.")
     return pauli_list
 
 def cost_func_estimator(
@@ -51,12 +55,29 @@ def cost_func_estimator(
     Returns:
         The estimated cost (expectation value).
     """
-    pub = (ansatz, [cost_hamiltonian], [params])
-    result = estimator.run(pubs=[pub]).result()
-    cost = result[0].data.evs[0]
+    # Ensure the ansatz has parameters to bind, otherwise pub might be invalid
+    # This is more of a sanity check; QAOAAnsatz should have parameters.
+    if not ansatz.parameters:
+        print("Warning: Ansatz has no parameters to bind.")
+        # Depending on EstimatorV2 behavior with parameterless circuits and value lists,
+        # this might need specific handling. For now, assume it proceeds or errors if invalid.
+
+    pub = (ansatz, [cost_hamiltonian], [params]) # params should be a list of values
+
+    try:
+        result = estimator.run(pubs=[pub]).result()
+        cost = result[0].data.evs[0]
+    except Exception as e:
+        print(f"Error in cost_func_estimator during estimator.run() or result processing: {e}")
+        print(f"  Parameters: {params}")
+        print(f"  Ansatz num_qubits: {ansatz.num_qubits if hasattr(ansatz, 'num_qubits') else 'N/A'}")
+        print(f"  Hamiltonian num_qubits: {cost_hamiltonian.num_qubits if hasattr(cost_hamiltonian, 'num_qubits') else 'N/A'}")
+        # Potentially re-raise or return a high cost to penalize
+        raise  # Re-raise the exception to make the optimizer aware of the failure
 
     callback_list.append(cost)
-    print(f"Parameters: {params}, Cost: {cost}") # Optional: for logging progress
+    # The following line was the optional print, now removed:
+    # print(f"Parameters: {params}, Cost: {cost}")
     return cost
 
 def to_bitstring(integer_representation: int, num_bits: int) -> List[int]:
@@ -70,14 +91,8 @@ def to_bitstring(integer_representation: int, num_bits: int) -> List[int]:
     Returns:
         A list of integers (0 or 1) representing the bitstring.
     """
-    # np.binary_repr returns a string, e.g., '101'
-    # We need to convert it to a list of ints [1, 0, 1]
-    # The string is typically ordered from most significant to least significant.
-    # Depending on convention, you might need to reverse it.
-    # Qiskit's convention is usually q_n-1 ... q_1 q_0 (rightmost is qubit 0).
-    # If the integer comes from measurement outcomes, it usually matches this.
     bitstring_str = np.binary_repr(integer_representation, width=num_bits)
-    return [int(digit) for digit in bitstring_str] # MSB first by default from binary_repr
+    return [int(digit) for digit in bitstring_str]
 
 def evaluate_max_cut_solution(bitstring: Sequence[int], graph: rx.PyGraph) -> float:
     """
@@ -92,12 +107,26 @@ def evaluate_max_cut_solution(bitstring: Sequence[int], graph: rx.PyGraph) -> fl
     Returns:
         The value of the cut defined by the bitstring.
     """
+    if graph.num_nodes() == 0: # Handle empty graph
+        return 0.0
     if len(bitstring) != graph.num_nodes():
-        raise ValueError("Length of bitstring must match the number of nodes in the graph.")
+        # This can happen if the bitstring comes from a circuit with M qubits
+        # but the logical graph has N qubits (N < M).
+        # The main script should handle slicing the bitstring to N bits before calling this.
+        print(f"Warning in evaluate_max_cut_solution: Bitstring length ({len(bitstring)}) "
+              f"does not match graph nodes ({graph.num_nodes()}). Ensure bitstring is for logical qubits.")
+        # Adjust bitstring if it's longer, assuming it's for the physical qubits
+        # and the logical ones are the first N. This depends on bitstring ordering.
+        # For now, we'll raise an error if not matching, expecting main to handle.
+        raise ValueError(f"Length of bitstring ({len(bitstring)}) must match the number of nodes ({graph.num_nodes()}) in the graph for evaluation.")
+
 
     cut_value = 0.0
     for u, v, weight in graph.weighted_edge_list():
-        # If nodes u and v are in different partitions, add the edge weight to the cut
-        if bitstring[u] != bitstring[v]:
-            cut_value += float(weight) # Ensure weight is float
+        # Ensure u and v are within the bounds of the bitstring
+        if u < len(bitstring) and v < len(bitstring):
+            if bitstring[u] != bitstring[v]:
+                cut_value += float(weight)
+        else:
+            print(f"Warning: Edge ({u},{v}) in graph is out of bounds for bitstring of length {len(bitstring)}. Skipping this edge in evaluation.")
     return cut_value
